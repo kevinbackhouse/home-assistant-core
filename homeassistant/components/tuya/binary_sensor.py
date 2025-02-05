@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 
 from tuya_sharing import CustomerDevice, Manager
 
@@ -17,7 +18,7 @@ from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from . import TuyaConfigEntry
-from .const import TUYA_DISCOVERY_NEW, DPCode
+from .const import LOGGER, TUYA_DISCOVERY_NEW, DPCode
 from .entity import TuyaEntity
 
 
@@ -340,6 +341,37 @@ BINARY_SENSORS: dict[str, tuple[TuyaBinarySensorEntityDescription, ...]] = {
 }
 
 
+# Sometimes bitmaps are used to pack the status of several binary sensors
+# into one integer. In the home assistant interface, it is more convenient
+# to represent each bit of the bitmap as a separate binary sensor. So
+# each TuyaBitmapSensorEntityDescription gets converted into several
+# TuyaBinarySensorEntityDescription's during async_discover_device.
+@dataclass(frozen=True)
+class TuyaBitmapSensorEntityDescription(TuyaBinarySensorEntityDescription):
+    """Describes a Tuya bitmap sensor."""
+
+    # Which bits to convert into binary sensors
+    mask: int = 0
+
+    # Bitmask which specifies, for each bit, whether a 1 means "on" or "off"
+    onoffmask: int = 0
+
+
+BITMAP_SENSORS: dict[str, tuple[TuyaBitmapSensorEntityDescription, ...]] = {
+    # Dehumidifier (however, these bitmap values are currently undocumented)
+    # https://developer.tuya.com/en/docs/iot/s?id=K9gf48r6jke8e
+    "cs": (
+        TuyaBitmapSensorEntityDescription(
+            key=DPCode.FAULT,
+            device_class=BinarySensorDeviceClass.PROBLEM,
+            entity_category=EntityCategory.DIAGNOSTIC,
+            mask=0x83,  # tankfull, defrost, wet
+            onoffmask=0x00,
+        ),
+    ),
+}
+
+
 async def async_setup_entry(
     hass: HomeAssistant, entry: TuyaConfigEntry, async_add_entities: AddEntitiesCallback
 ) -> None:
@@ -352,15 +384,44 @@ async def async_setup_entry(
         entities: list[TuyaBinarySensorEntity] = []
         for device_id in device_ids:
             device = hass_data.manager.device_map[device_id]
-            if descriptions := BINARY_SENSORS.get(device.category):
-                for description in descriptions:
-                    dpcode = description.dpcode or description.key
-                    if dpcode in device.status:
+            for description in BINARY_SENSORS.get(device.category, []):
+                dpcode = description.dpcode or description.key
+                if dpcode in device.status:
+                    entities.append(
+                        TuyaBinarySensorEntity(device, hass_data.manager, description)
+                    )
+
+            for description in BITMAP_SENSORS.get(device.category, []):
+                dpcode = description.dpcode or description.key
+                if dpcode not in device.status:
+                    continue
+                try:
+                    status = device.status[dpcode]
+                    status_range = device.status_range[dpcode]
+                    labels = json.loads(status_range.values)["label"]
+                    assert status_range.type == "Bitmap"
+                    for i, label in enumerate(labels):
+                        xi = 1 << i
+                        if (xi & description.mask) == 0:
+                            continue
+                        on_value = (status & xi) == (description.onoffmask & xi)
                         entities.append(
                             TuyaBinarySensorEntity(
-                                device, hass_data.manager, description
+                                device,
+                                hass_data.manager,
+                                TuyaBinarySensorEntityDescription(
+                                    key=f"{dpcode}_{label}",
+                                    dpcode=description.dpcode,
+                                    translation_key=label,
+                                    device_class=description.device_class,
+                                    entity_category=description.entity_category,
+                                    on_value=on_value,
+                                    name=label,
+                                ),
                             )
                         )
+                except (AssertionError, IndexError, ValueError):
+                    LOGGER.exception("Invalid Bitmap device: %s", str(device))
 
         async_add_entities(entities)
 
